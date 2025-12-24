@@ -1,0 +1,1097 @@
+import React, { useState, useEffect, useRef } from 'react';
+import { Trophy, ArrowRight, RefreshCw, CheckCircle, XCircle, Brain, ChevronRight, HelpCircle, Timer, Clock, Heart, Zap, Play, User, List, StopCircle, Delete, ArrowLeftRight, Calendar, AlertTriangle, WifiOff } from 'lucide-react';
+import { initializeApp } from 'firebase/app';
+import { getAuth, signInAnonymously, onAuthStateChanged, signInWithCustomToken } from 'firebase/auth';
+import { getFirestore, collection, addDoc, onSnapshot, query, doc, setDoc } from 'firebase/firestore';
+
+// --- Firebase Initialization with Error Handling ---
+let app, auth, db;
+let initError = null;
+
+try {
+  if (typeof __firebase_config === 'undefined') {
+    throw new Error("環境設定遺失 (Config Missing): 請確認您是透過正確的發布連結進入，而非原始程式碼頁面。");
+  }
+  const firebaseConfig = JSON.parse(__firebase_config);
+  app = initializeApp(firebaseConfig);
+  auth = getAuth(app);
+  db = getFirestore(app);
+} catch (e) {
+  console.error("Firebase Init Error:", e);
+  initError = e.message;
+}
+
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+
+/**
+ * Utility to format polynomial string nicely
+ */
+const formatPolynomial = (a, b, c) => {
+  let str = '';
+  // x^2 term
+  if (a === 0) {
+  } else if (a === 1) {
+    str += 'x²';
+  } else if (a === -1) {
+    str += '-x²';
+  } else {
+    str += `${a}x²`;
+  }
+  // x term
+  if (b === 0) {
+  } else if (b > 0) {
+    str += ` + ${b === 1 ? '' : b}x`;
+  } else {
+    str += ` - ${b === -1 ? '' : Math.abs(b)}x`;
+  }
+  // Constant term
+  if (c === 0) {
+    if (str === '') str = '0';
+  } else if (c > 0) {
+    str += ` + ${c}`;
+  } else {
+    str += ` - ${Math.abs(c)}`;
+  }
+  return str;
+};
+
+// Helper to format seconds into MM:SS
+const formatTime = (seconds) => {
+  if (!seconds && seconds !== 0) return '--:--';
+  const m = Math.floor(seconds / 60);
+  const s = Math.floor(seconds % 60);
+  return `${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
+};
+
+const FactorizationGame = () => {
+  // --- System State ---
+  const [systemError, setSystemError] = useState(initError);
+  const [isAuthReady, setIsAuthReady] = useState(false);
+  const [authInitiated, setAuthInitiated] = useState(false); // Track if explicit sign-in attempt finished
+  const [leaderboardError, setLeaderboardError] = useState(null); // Separate error for leaderboard
+
+  // --- User & Auth State ---
+  const [user, setUser] = useState(null);
+  const [playerName, setPlayerName] = useState('');
+  const [hasEnteredName, setHasEnteredName] = useState(false);
+  
+  // --- Game Configuration States ---
+  const [gameState, setGameState] = useState('login'); // 'login', 'menu', 'playing', 'ended', 'leaderboard'
+  const [gameMode, setGameMode] = useState('practice'); // 'practice', 'timeAttack', 'survival'
+  const [level, setLevel] = useState(1);
+  
+  // --- Gameplay States ---
+  const [problem, setProblem] = useState(null);
+  const [score, setScore] = useState(0);
+  const [streak, setStreak] = useState(0);
+  const [userInput, setUserInput] = useState({ a1: '', b1: '', a2: '', b2: '' });
+  const [activeField, setActiveField] = useState('a1'); // Track which input is active for the virtual keypad
+  const [feedback, setFeedback] = useState(null); // 'correct', 'incorrect', 'timeout', null
+  const [showSolution, setShowSolution] = useState(false);
+  const [isAnimate, setIsAnimate] = useState(false);
+  
+  // --- Mode Specific States ---
+  const [timeLeft, setTimeLeft] = useState(0);      // For Practice (per Q) & TimeAttack (global)
+  const [maxTime, setMaxTime] = useState(0);        // For progress bars
+  const [isTimerActive, setIsTimerActive] = useState(false);
+  const [lives, setLives] = useState(3);            // For Survival
+  const [stats, setStats] = useState({ correct: 0, incorrect: 0, maxStreak: 0 }); // For End Screen
+  
+  // --- Session Tracking ---
+  const startTimeRef = useRef(0); // To track total playtime duration
+  const [sessionDuration, setSessionDuration] = useState(0); // Duration in seconds for end screen
+  
+  // --- Anti-Repetition State ---
+  const recentProblemsRef = useRef([]); // Stores signatures of recent problems
+
+  // --- Leaderboard State ---
+  const [leaderboardData, setLeaderboardData] = useState([]);
+  const [isUploading, setIsUploading] = useState(false);
+
+  // Refs
+  const timerRef = useRef(null);
+
+  // Constants
+  // Updated time limits as requested: 20s, 40s, 60s
+  const PRACTICE_LIMITS = { 1: 20, 2: 40, 3: 60 };
+  const TIME_ATTACK_DURATION = 120; // 2 minutes
+
+  // --- Firebase Auth & Data Sync ---
+  useEffect(() => {
+    if (systemError) return;
+
+    let timeoutId;
+    const initAuth = async () => {
+      try {
+        // Timeout check: If auth takes longer than 8 seconds, warn the user
+        timeoutId = setTimeout(() => {
+          if (!user) {
+            setSystemError("連線逾時 (Timeout): 無法連接到資料庫，請檢查您的網路是否封鎖了 Firebase/Google 服務，或嘗試切換手機網路。");
+          }
+        }, 8000);
+
+        if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+          await signInWithCustomToken(auth, __initial_auth_token);
+        } else {
+          await signInAnonymously(auth);
+        }
+      } catch (e) {
+        console.error("Auth Error:", e);
+        // Retry with anonymous auth if custom token fails (fallback)
+        if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+           try {
+             console.log("Falling back to anonymous auth...");
+             await signInAnonymously(auth);
+           } catch (e2) {
+             console.error("Fallback Auth Error:", e2);
+             setSystemError(`登入失敗 (${e.code}): ${e.message}. 請確認網路連線。`);
+           }
+        } else {
+           setSystemError(`登入失敗 (${e.code}): ${e.message}. 請確認網路連線。`);
+        }
+      } finally {
+        // Add a small delay to ensure token propagation before querying
+        setTimeout(() => {
+          setAuthInitiated(true);
+        }, 500);
+      }
+    };
+
+    initAuth();
+    const unsubscribe = onAuthStateChanged(auth, (u) => {
+      if (u) {
+        setUser(u);
+        setIsAuthReady(true);
+        clearTimeout(timeoutId); // Clear timeout on success
+      }
+    });
+    return () => {
+      unsubscribe();
+      clearTimeout(timeoutId);
+    };
+  }, []);
+
+  // Fetch Leaderboard Data
+  useEffect(() => {
+    // Ensure we wait for auth initialization attempt to complete before querying
+    // This prevents "Missing or insufficient permissions" errors from stale persisted users
+    if (!user || systemError || !authInitiated) return;
+    
+    // We fetch ALL scores and filter client-side due to "No Complex Queries" rule
+    const q = query(collection(db, 'artifacts', appId, 'public', 'data', 'scores'));
+    
+    const unsubscribe = onSnapshot(q, (snapshot) => {
+      const data = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+      setLeaderboardData(data);
+      setLeaderboardError(null); // Clear error on success
+    }, (error) => {
+      console.error("Error fetching leaderboard:", error);
+      if (error.code === 'permission-denied') {
+         setLeaderboardError("無法讀取: 權限不足");
+      } else {
+         setLeaderboardError("連線異常");
+      }
+    });
+
+    return () => unsubscribe();
+  }, [user, systemError, authInitiated]);
+
+  // --- Game Loop Control ---
+
+  const handleNameSubmit = () => {
+    if (playerName.trim().length > 0) {
+      setHasEnteredName(true);
+      setGameState('menu');
+      localStorage.setItem('factorization_player_name', playerName);
+    }
+  };
+
+  useEffect(() => {
+    const savedName = localStorage.getItem('factorization_player_name');
+    if (savedName) setPlayerName(savedName);
+  }, []);
+
+  // Start Game
+  const startGame = (mode) => {
+    setGameMode(mode);
+    setGameState('playing');
+    setScore(0);
+    setStreak(0);
+    setStats({ correct: 0, incorrect: 0, maxStreak: 0 });
+    setFeedback(null);
+    setShowSolution(false);
+    
+    // Reset recent problems for a new game session if desired, 
+    // or keep them to prevent repeats from previous session. 
+    // Let's keep them to ensure variety across sessions if user restarts quickly.
+    
+    // Start session timer
+    startTimeRef.current = Date.now();
+    
+    if (mode === 'survival') {
+      setLives(3);
+    } else if (mode === 'timeAttack') {
+      setTimeLeft(TIME_ATTACK_DURATION);
+      setMaxTime(TIME_ATTACK_DURATION);
+      setIsTimerActive(true);
+    }
+
+    generateProblem(mode, level);
+  };
+
+  const goHome = () => {
+    setGameState('menu');
+    setIsTimerActive(false);
+    if (timerRef.current) clearInterval(timerRef.current);
+  };
+  
+  const handleManualFinish = () => {
+    if (score > 0) {
+      endGame();
+    } else {
+      goHome();
+    }
+  };
+
+  // Timer Logic
+  useEffect(() => {
+    if (isTimerActive && timeLeft > 0 && gameState === 'playing') {
+      timerRef.current = setInterval(() => {
+        setTimeLeft((prev) => {
+          if (prev <= 1) {
+             return 0;
+          }
+          return prev - 1;
+        });
+      }, 1000);
+    } else if (timeLeft === 0 && isTimerActive && gameState === 'playing') {
+      handleTimeUp();
+    }
+    return () => clearInterval(timerRef.current);
+  }, [isTimerActive, timeLeft, gameState]);
+
+  const handleTimeUp = () => {
+    if (gameMode === 'practice') {
+      setIsTimerActive(false);
+      setFeedback('timeout');
+      setStreak(0);
+      setScore(prev => Math.max(0, prev - (level * 5)));
+      setShowSolution(true);
+      setStats(s => ({ ...s, incorrect: s.incorrect + 1 }));
+    } else if (gameMode === 'timeAttack') {
+      endGame();
+    } else if (gameMode === 'survival') {
+      setIsTimerActive(false);
+      setFeedback('timeout');
+      setStreak(0);
+      setStats(s => ({ ...s, incorrect: s.incorrect + 1 }));
+      setShowSolution(true);
+      setLives(prev => {
+        const newLives = prev - 1;
+        if (newLives <= 0) endGame();
+        return newLives;
+      });
+    }
+  };
+
+  const endGame = async () => {
+    setGameState('ended');
+    setIsTimerActive(false);
+    
+    // Calculate final duration
+    const endTimestamp = Date.now();
+    const durationMs = endTimestamp - startTimeRef.current;
+    const durationSec = Math.floor(durationMs / 1000);
+    setSessionDuration(durationSec);
+
+    if (user && score > 0) {
+      setIsUploading(true);
+      try {
+        await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'scores'), {
+          name: playerName,
+          score: score,
+          mode: gameMode,
+          level: level,
+          timestamp: endTimestamp,
+          stats: stats,
+          duration: durationSec, // Save duration
+          totalQuestions: stats.correct + stats.incorrect,
+          userId: user.uid
+        });
+      } catch (e) {
+        console.error("Error uploading score", e);
+      } finally {
+        setIsUploading(false);
+      }
+    }
+  };
+
+  const generateProblem = (currentMode = gameMode, currentLevel = level) => {
+    const rand = (min, max) => Math.floor(Math.random() * (max - min + 1)) + min;
+    const nonZeroRand = (min, max) => {
+      let r = 0;
+      while (r === 0) r = rand(min, max);
+      return r;
+    };
+
+    let a1, b1, a2, b2;
+    let attempts = 0;
+    let isUnique = false;
+    let signature = "";
+
+    // --- Anti-Repetition Loop ---
+    // Try up to 20 times to find a problem that hasn't been shown recently
+    while (!isUnique && attempts < 20) {
+      if (currentLevel === 1) {
+        a1 = 1; a2 = 1;
+        b1 = nonZeroRand(-9, 9); b2 = nonZeroRand(-9, 9);
+      } else if (currentLevel === 2) {
+        a1 = rand(1, 3); a2 = rand(1, 4);
+        b1 = nonZeroRand(-5, 5); b2 = nonZeroRand(-5, 5);
+      } else {
+        a1 = rand(2, 5); a2 = rand(2, 6);
+        b1 = nonZeroRand(-9, 9); b2 = nonZeroRand(-9, 9);
+      }
+
+      // Create a normalized signature for uniqueness check
+      // Sort the two factors to handle symmetry: (x+2)(x+3) == (x+3)(x+2)
+      // Logic: compare a1 vs a2, then b1 vs b2
+      let p1 = { a: a1, b: b1 };
+      let p2 = { a: a2, b: b2 };
+      
+      // Determine order: simply check if p1 > p2 based on a then b
+      let swap = false;
+      if (p1.a > p2.a) swap = true;
+      else if (p1.a === p2.a && p1.b > p2.b) swap = true;
+
+      if (swap) {
+        [p1, p2] = [p2, p1];
+      }
+
+      signature = `${p1.a},${p1.b}|${p2.a},${p2.b}`;
+
+      if (!recentProblemsRef.current.includes(signature)) {
+        isUnique = true;
+      }
+      attempts++;
+    }
+
+    // Add to history queue
+    recentProblemsRef.current.push(signature);
+    if (recentProblemsRef.current.length > 8) { // Remember last 8 problems
+      recentProblemsRef.current.shift();
+    }
+
+    const A = a1 * a2;
+    const B = a1 * b2 + a2 * b1;
+    const C = b1 * b2;
+
+    setProblem({ A, B, C, factors: { a1, b1, a2, b2 } });
+    setUserInput({ a1: '', b1: '', a2: '', b2: '' });
+    setActiveField('a1'); // Reset focus to first field
+    setFeedback(null);
+    setShowSolution(false);
+    setIsAnimate(true);
+    setTimeout(() => setIsAnimate(false), 500);
+
+    if (currentMode === 'practice' || currentMode === 'survival') {
+      const limit = PRACTICE_LIMITS[currentLevel];
+      setMaxTime(limit);
+      setTimeLeft(limit);
+      setIsTimerActive(true);
+    }
+  };
+
+  const checkAnswer = () => {
+    if (gameMode === 'practice' || gameMode === 'survival') setIsTimerActive(false);
+
+    const { a1, b1, a2, b2 } = userInput;
+    const u_a1 = a1 === '' || a1 === '-' ? (a1 === '-' ? -1 : 1) : parseInt(a1);
+    const u_b1 = b1 === '' ? 0 : parseInt(b1);
+    const u_a2 = a2 === '' || a2 === '-' ? (a2 === '-' ? -1 : 1) : parseInt(a2);
+    const u_b2 = b2 === '' ? 0 : parseInt(b2);
+
+    const userA = u_a1 * u_a2;
+    const userB = u_a1 * u_b2 + u_a2 * u_b1;
+    const userC = u_b1 * u_b2;
+
+    const isCorrect = (userA === problem.A && userB === problem.B && userC === problem.C);
+
+    if (isCorrect) {
+      handleCorrect();
+    } else {
+      handleIncorrect();
+    }
+  };
+
+  const handleCorrect = () => {
+    setFeedback('correct');
+    const newStreak = streak + 1;
+    setStreak(newStreak);
+    setStats(s => ({ ...s, correct: s.correct + 1, maxStreak: Math.max(s.maxStreak, newStreak) }));
+
+    let points = level * 10 + streak * 5;
+    if (gameMode === 'practice' || gameMode === 'survival') points += timeLeft; 
+    setScore(score + points);
+
+    if (gameMode === 'survival') {
+      if (newStreak > 0 && newStreak % 5 === 0 && lives < 5) {
+        setLives(l => l + 1);
+      }
+      setTimeout(generateProblem, 1000); 
+    } else if (gameMode === 'timeAttack') {
+      setTimeout(generateProblem, 600); 
+    } else {
+      setTimeout(generateProblem, 1000);
+    }
+  };
+
+  const handleIncorrect = () => {
+    setFeedback('incorrect');
+    setStreak(0);
+    setStats(s => ({ ...s, incorrect: s.incorrect + 1 }));
+    
+    if (gameMode === 'practice') {
+      setScore(Math.max(0, score - 5));
+      setShowSolution(true); 
+    } else if (gameMode === 'timeAttack') {
+      setScore(Math.max(0, score - 10)); 
+      setShowSolution(true); 
+      setTimeout(() => {
+          if (gameState === 'playing') generateProblem();
+      }, 2000);
+    } else if (gameMode === 'survival') {
+      setLives(prev => {
+        const newLives = prev - 1;
+        if (newLives <= 0) endGame();
+        return newLives;
+      });
+      setShowSolution(true);
+    }
+  };
+
+  // --- Virtual Keypad Logic ---
+  const handleKeypadPress = (key) => {
+    if (!activeField || feedback === 'correct' || feedback === 'timeout') {
+       // Allow Enter to proceed even if feedback is set (for correct/timeout auto-advance override or manual confirm)
+       if (key !== 'ENTER') return;
+    }
+    // Block input if incorrect feedback is showing (waiting for user to review), UNLESS key is enter (to proceed)
+    if (feedback === 'incorrect' && key !== 'ENTER') return;
+
+    // Define field order for navigation
+    const order = ['a1', 'b1', 'a2', 'b2'];
+
+    if (key === 'ENTER') {
+      // Logic for Enter key: Check or Next
+      if (feedback === 'correct' || feedback === 'timeout') {
+         if (gameMode !== 'timeAttack') generateProblem();
+      } else if (feedback === 'incorrect') {
+         // Fix: Allow continuing in practice mode or survival mode
+         if (gameMode === 'practice' || (gameMode === 'survival' && lives > 0)) {
+             generateProblem();
+         }
+      } else {
+        checkAnswer();
+      }
+      return;
+    }
+
+    if (key === 'TAB') {
+      // Cycle through fields a1 -> b1 -> a2 -> b2 -> a1
+      const currentIndex = order.indexOf(activeField);
+      const nextIndex = (currentIndex + 1) % order.length;
+      setActiveField(order[nextIndex]);
+      return;
+    }
+
+    if (key === 'DEL') {
+      setUserInput(prev => ({ ...prev, [activeField]: prev[activeField].slice(0, -1) }));
+      return;
+    }
+
+    // Numbers and Minus
+    const currentVal = userInput[activeField];
+    if (key === '-' && currentVal.includes('-')) return; // prevent double minus
+    
+    // Simple validation for length to prevent overflow
+    if (currentVal.length < 3) {
+       const newVal = currentVal + key;
+       setUserInput(prev => ({ ...prev, [activeField]: newVal }));
+
+       // --- Auto-Advance Logic ---
+       // Automatically jump to next field if the input is a complete number
+       // Conditions: 
+       // 1. A single positive digit (e.g., "5")
+       // 2. A negative sign followed by a digit (e.g., "-5")
+       // This works perfectly for the current game range (-9 to 9)
+       
+       const isPositiveDigit = /^[0-9]$/.test(newVal);
+       const isNegativeDigit = /^-[0-9]$/.test(newVal);
+
+       if (isPositiveDigit || isNegativeDigit) {
+          const currentIndex = order.indexOf(activeField);
+          // If it is NOT the last field, auto-advance
+          if (currentIndex < order.length - 1) {
+             setActiveField(order[currentIndex + 1]);
+          }
+       }
+    }
+  };
+
+  // --- Keyboard Event Listener for Desktop Support ---
+  useEffect(() => {
+    const handleGlobalKeyDown = (e) => {
+      // Only active in playing state
+      if (gameState !== 'playing') return;
+
+      const key = e.key;
+
+      // Mapping physical keys to virtual keypad actions
+      if (key === 'Enter') {
+        e.preventDefault(); // Prevent default form submission if any
+        handleKeypadPress('ENTER');
+      } else if (key === 'Tab') {
+        e.preventDefault(); // Prevent default focus switching
+        handleKeypadPress('TAB');
+      } else if (key === 'Backspace' || key === 'Delete') {
+        handleKeypadPress('DEL');
+      } else if (key === '-' || key === 'Subtract') {
+        handleKeypadPress('-');
+      } else if (/^[0-9]$/.test(key)) {
+        handleKeypadPress(key);
+      }
+    };
+
+    window.addEventListener('keydown', handleGlobalKeyDown);
+    return () => window.removeEventListener('keydown', handleGlobalKeyDown);
+  }, [gameState, handleKeypadPress]);
+
+  // --- Helper Components ---
+
+  const ErrorDisplay = () => (
+    <div className="min-h-screen bg-rose-50 flex flex-col items-center justify-center p-4 font-sans text-slate-800">
+      <div className="bg-white p-8 rounded-3xl shadow-xl max-w-md w-full text-center border-b-8 border-rose-200">
+        <div className="flex justify-center mb-4">
+          <div className="bg-rose-100 p-4 rounded-full">
+            <WifiOff className="w-12 h-12 text-rose-600" />
+          </div>
+        </div>
+        <h1 className="text-xl font-bold text-rose-800 mb-2">連線發生錯誤</h1>
+        <p className="text-slate-600 mb-6 text-sm leading-relaxed">
+          系統無法正常啟動，可能原因如下：
+        </p>
+        <ul className="text-left text-sm text-slate-600 list-disc pl-6 mb-6 space-y-2">
+          <li><strong>網路封鎖</strong>：學校 Wi-Fi 可能阻擋了遊戲連線。請嘗試切換手機 4G/5G 網路。</li>
+          <li><strong>連結失效</strong>：請確認您使用的是老師提供的最新連結。</li>
+          <li><strong>瀏覽器設定</strong>：請嘗試關閉「無痕模式」或更換瀏覽器。</li>
+        </ul>
+        <div className="bg-slate-100 p-3 rounded-lg text-xs text-slate-500 font-mono break-all text-left">
+          錯誤代碼: {systemError}
+        </div>
+        <button 
+          onClick={() => window.location.reload()}
+          className="mt-6 w-full bg-rose-600 hover:bg-rose-700 text-white py-3 rounded-xl font-bold transition-all flex items-center justify-center gap-2"
+        >
+          <RefreshCw size={18} /> 重新整理頁面
+        </button>
+      </div>
+    </div>
+  );
+
+  const VirtualKeypad = () => {
+    const keys = ['1', '2', '3', '4', '5', '6', '7', '8', '9', '-', '0', 'DEL'];
+    
+    return (
+      <div className="bg-slate-100 p-2 rounded-xl mt-4 max-w-md w-full mx-auto select-none">
+        <div className="grid grid-cols-4 gap-2">
+           {keys.map(k => (
+             <button
+               key={k}
+               onClick={() => handleKeypadPress(k)}
+               className="bg-white shadow-sm border-b-2 border-slate-200 active:border-b-0 active:translate-y-[2px] rounded-lg py-3 text-xl font-bold text-slate-700 hover:bg-slate-50 transition-all"
+             >
+               {k === 'DEL' ? <Delete className="mx-auto" size={24}/> : k}
+             </button>
+           ))}
+           <button
+             onClick={() => handleKeypadPress('TAB')}
+             className="col-span-2 bg-indigo-100 text-indigo-700 shadow-sm border-b-2 border-indigo-200 active:border-b-0 active:translate-y-[2px] rounded-lg py-3 font-bold transition-all flex items-center justify-center gap-2"
+           >
+             <ArrowLeftRight size={20} /> 下一格 (Tab)
+           </button>
+           <button
+             onClick={() => handleKeypadPress('ENTER')}
+             className={`col-span-2 shadow-sm border-b-2 active:border-b-0 active:translate-y-[2px] rounded-lg py-3 font-bold text-white transition-all flex items-center justify-center gap-2 ${feedback ? 'bg-emerald-500 border-emerald-600' : 'bg-indigo-600 border-indigo-800'}`}
+           >
+             {feedback ? (feedback === 'correct' ? '下一題' : '繼續') : '確認 (Enter)'}
+           </button>
+        </div>
+      </div>
+    );
+  };
+
+  const LeaderboardView = () => {
+    // Filter and Sort Data
+    const filteredData = leaderboardData
+      .filter(item => item.mode === gameMode && item.level === level)
+      .sort((a, b) => b.score - a.score)
+      .slice(0, 10); // Top 10
+
+    return (
+      <div className="bg-white rounded-2xl shadow-xl overflow-hidden border border-slate-200">
+        <div className="bg-indigo-600 p-4 text-white text-center">
+          <h3 className="font-bold text-lg flex items-center justify-center gap-2">
+            <Trophy className="text-yellow-300" /> 
+            {gameMode === 'timeAttack' ? '限時衝刺' : gameMode === 'survival' ? '生存挑戰' : '單題練習'} (Lv.{level}) 排行榜
+          </h3>
+        </div>
+        <div className="max-h-60 overflow-y-auto">
+          {leaderboardError ? (
+             <div className="p-8 text-center text-rose-400 flex flex-col items-center gap-2">
+                <WifiOff size={24} />
+                <span>{leaderboardError}</span>
+             </div>
+          ) : filteredData.length === 0 ? (
+            <div className="p-8 text-center text-slate-400">目前還沒有紀錄，快來當第一名！</div>
+          ) : (
+            <table className="w-full text-left text-sm">
+              <thead className="bg-slate-50 text-slate-500 font-bold">
+                <tr>
+                  <th className="p-3 w-12">#</th>
+                  <th className="p-3">姓名</th>
+                  <th className="p-3 text-center hidden sm:table-cell">時間</th>
+                  <th className="p-3 text-center hidden sm:table-cell">正確率</th>
+                  <th className="p-3 text-right">分數</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-slate-100">
+                {filteredData.map((entry, index) => {
+                  const total = (entry.stats?.correct || 0) + (entry.stats?.incorrect || 0);
+                  const accuracy = total > 0 ? Math.round((entry.stats.correct / total) * 100) : 0;
+                  
+                  return (
+                    <tr key={entry.id} className={entry.name === playerName ? "bg-indigo-50" : ""}>
+                      <td className="p-3 font-mono text-slate-400 font-bold">{index + 1}</td>
+                      <td className="p-3 font-bold text-slate-700">
+                        {entry.name}
+                        {/* Mobile only details */}
+                        <div className="sm:hidden text-xs text-slate-400 font-normal mt-1 flex items-center gap-2">
+                          <span className="flex items-center gap-0.5"><Clock size={10}/> {entry.duration ? formatTime(entry.duration) : '--:--'}</span>
+                          <span className={`flex items-center gap-0.5 ${accuracy >= 90 ? 'text-emerald-600 font-bold' : ''}`}><CheckCircle size={10}/> {accuracy}%</span>
+                        </div>
+                      </td>
+                      <td className="p-3 text-center font-mono text-slate-500 hidden sm:table-cell">
+                        {entry.duration ? formatTime(entry.duration) : '--:--'}
+                      </td>
+                      <td className="p-3 text-center font-mono text-slate-500 hidden sm:table-cell">
+                         <span className={`${accuracy >= 90 ? 'text-emerald-500 font-bold' : ''}`}>{accuracy}%</span>
+                      </td>
+                      <td className="p-3 text-right font-mono text-indigo-600 font-bold">{entry.score}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          )}
+        </div>
+      </div>
+    );
+  };
+
+  // --- Main Render Switch ---
+
+  // 0. System Error Screen
+  if (systemError) {
+    return <ErrorDisplay />;
+  }
+
+  // 0.5 Loading Auth
+  if (!isAuthReady) {
+    return (
+      <div className="min-h-screen bg-slate-50 flex flex-col items-center justify-center p-4">
+        <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-indigo-600 mb-4"></div>
+        <p className="text-slate-500 font-bold">正在連線到雲端排行榜...</p>
+        <p className="text-xs text-slate-400 mt-2">請稍候</p>
+      </div>
+    );
+  }
+
+  // 1. Login Screen (Enter Name)
+  if (gameState === 'login') {
+    return (
+      <div className="min-h-screen bg-slate-50 flex flex-col items-center justify-center p-4 font-sans text-slate-800">
+        <div className="bg-white p-8 rounded-3xl shadow-xl max-w-md w-full text-center border-b-8 border-indigo-100">
+           <div className="flex justify-center mb-6">
+             <div className="bg-indigo-100 p-4 rounded-full">
+               <User className="w-12 h-12 text-indigo-600" />
+             </div>
+           </div>
+           <h1 className="text-2xl font-bold text-slate-800 mb-2">歡迎來到因式分解大師</h1>
+           <p className="text-slate-500 mb-6">請輸入你的姓名或暱稱以開始遊戲</p>
+           
+           <input 
+             type="text" 
+             value={playerName}
+             onChange={(e) => setPlayerName(e.target.value)}
+             placeholder="輸入姓名..."
+             className="w-full bg-slate-100 border-2 border-slate-200 rounded-xl p-4 text-center font-bold text-lg focus:border-indigo-500 focus:outline-none mb-4"
+             onKeyDown={(e) => e.key === 'Enter' && handleNameSubmit()}
+           />
+           
+           <button 
+             onClick={handleNameSubmit}
+             disabled={!playerName.trim()}
+             className="w-full bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 disabled:cursor-not-allowed text-white py-4 rounded-xl font-bold shadow-lg shadow-indigo-200 transition-all flex justify-center items-center gap-2"
+           >
+             開始挑戰 <ArrowRight size={20} />
+           </button>
+        </div>
+      </div>
+    );
+  }
+
+  // 2. Menu Screen
+  if (gameState === 'menu' || gameState === 'leaderboard') {
+    return (
+      <div className="min-h-screen bg-slate-50 flex flex-col items-center justify-center p-4 font-sans text-slate-800">
+        <div className="bg-white p-6 md:p-8 rounded-3xl shadow-xl max-w-md w-full text-center border-b-8 border-indigo-100 relative">
+          
+          <button onClick={() => setGameState('login')} className="absolute top-4 right-4 text-xs bg-slate-100 px-2 py-1 rounded text-slate-500">
+             更換名字: {playerName}
+          </button>
+
+          <div className="flex justify-center mb-4 mt-2">
+             <div className="bg-indigo-100 p-3 rounded-full">
+               <Brain className="w-10 h-10 text-indigo-600" />
+             </div>
+          </div>
+          <h1 className="text-3xl font-bold text-indigo-800 mb-2">因式分解大師</h1>
+          
+          {gameState === 'menu' ? (
+            <>
+              <p className="text-slate-500 mb-6">選擇挑戰模式</p>
+              <div className="space-y-3">
+                <button onClick={() => startGame('practice')} className="w-full bg-white border-2 border-indigo-100 hover:border-indigo-500 hover:bg-indigo-50 p-3 rounded-xl flex items-center gap-4 transition-all group text-left">
+                  <div className="bg-indigo-500 text-white p-3 rounded-lg group-hover:scale-110 transition-transform"><Brain size={20}/></div>
+                  <div>
+                    <div className="font-bold text-indigo-900">單題練習模式</div>
+                    <div className="text-xs text-slate-500">適合初學，每題獨立計時，<span className="text-indigo-600 font-bold">累積積分可隨時結算</span></div>
+                  </div>
+                </button>
+
+                <button onClick={() => startGame('timeAttack')} className="w-full bg-white border-2 border-orange-100 hover:border-orange-500 hover:bg-orange-50 p-3 rounded-xl flex items-center gap-4 transition-all group text-left">
+                  <div className="bg-orange-500 text-white p-3 rounded-lg group-hover:scale-110 transition-transform"><Zap size={20}/></div>
+                  <div>
+                    <div className="font-bold text-orange-900">限時衝刺模式</div>
+                    <div className="text-xs text-slate-500">120 秒內挑戰最高分</div>
+                  </div>
+                </button>
+
+                <button onClick={() => startGame('survival')} className="w-full bg-white border-2 border-rose-100 hover:border-rose-500 hover:bg-rose-50 p-3 rounded-xl flex items-center gap-4 transition-all group text-left">
+                  <div className="bg-rose-500 text-white p-3 rounded-lg group-hover:scale-110 transition-transform"><Heart size={20}/></div>
+                  <div>
+                    <div className="font-bold text-rose-900">生存挑戰模式</div>
+                    <div className="text-xs text-slate-500">3 條命，<span className="text-rose-600 font-bold">限時作答</span>，連對 5 題回血</div>
+                  </div>
+                </button>
+              </div>
+
+              <div className="mt-6 pt-4 border-t border-slate-100">
+                <div className="flex justify-between items-center mb-4">
+                  <span className="text-sm text-slate-400 font-bold">難度選擇</span>
+                  <div className="flex gap-1">
+                    {[1, 2, 3].map(l => (
+                      <button 
+                        key={l}
+                        onClick={() => setLevel(l)}
+                        className={`w-8 h-8 rounded-lg text-sm font-bold transition-all ${level === l ? 'bg-slate-800 text-white' : 'bg-slate-100 text-slate-400 hover:bg-slate-200'}`}
+                      >
+                        {l}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+                <button onClick={() => setGameState('leaderboard')} className="w-full py-2 text-indigo-600 font-bold bg-indigo-50 rounded-lg hover:bg-indigo-100 transition flex items-center justify-center gap-2">
+                  <List size={18} /> 查看排行榜
+                </button>
+              </div>
+            </>
+          ) : (
+            <div className="animate-fade-in">
+               <div className="flex justify-between items-center mb-4">
+                  <h2 className="font-bold text-slate-700">排行榜</h2>
+                  <div className="flex gap-2">
+                     <select className="bg-slate-100 text-xs p-1 rounded" value={gameMode} onChange={e => setGameMode(e.target.value)}>
+                       <option value="practice">練習</option>
+                       <option value="timeAttack">限時</option>
+                       <option value="survival">生存</option>
+                     </select>
+                     <div className="flex gap-1">
+                        {[1, 2, 3].map(l => (
+                          <button key={l} onClick={() => setLevel(l)} className={`w-6 h-6 text-xs rounded font-bold ${level === l ? 'bg-slate-800 text-white' : 'bg-slate-200 text-slate-500'}`}>{l}</button>
+                        ))}
+                     </div>
+                  </div>
+               </div>
+               <LeaderboardView />
+               <button onClick={() => setGameState('menu')} className="mt-4 w-full py-3 bg-slate-200 text-slate-600 font-bold rounded-xl hover:bg-slate-300 transition">
+                 返回選單
+               </button>
+            </div>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  // 3. End Screen
+  if (gameState === 'ended') {
+    const totalQuestions = stats.correct + stats.incorrect;
+    const accuracy = totalQuestions > 0 ? Math.round((stats.correct / totalQuestions) * 100) : 0;
+
+    return (
+      <div className="min-h-screen bg-slate-50 flex flex-col items-center justify-center p-4 font-sans text-slate-800">
+        <div className="bg-white p-8 rounded-3xl shadow-xl max-w-md w-full text-center animate-fade-in relative">
+           <Trophy className="w-16 h-16 text-yellow-400 mx-auto mb-4" />
+           <h2 className="text-3xl font-bold text-slate-800 mb-2">挑戰結束</h2>
+           <p className="text-slate-500 mb-2">
+             {gameMode === 'timeAttack' ? '時間到！手速真快！' : gameMode === 'survival' ? '生命值耗盡，下次加油！' : '成績已結算並上傳！'}
+           </p>
+           {isUploading && <p className="text-xs text-indigo-500 mb-4 animate-pulse">正在上傳成績...</p>}
+           
+           <div className="text-5xl font-bold text-indigo-600 mb-6">{score} <span className="text-base text-slate-400 font-normal">pts</span></div>
+
+           <div className="bg-slate-50 rounded-xl p-4 mb-6 grid grid-cols-2 gap-4">
+              <div className="flex flex-col items-center border-r border-slate-200">
+                 <div className="text-slate-400 text-xs font-bold uppercase mb-1">總遊玩時間</div>
+                 <div className="text-xl font-bold text-slate-700 flex items-center gap-1">
+                   <Clock size={18} /> {formatTime(sessionDuration)}
+                 </div>
+              </div>
+              <div className="flex flex-col items-center">
+                 <div className="text-slate-400 text-xs font-bold uppercase mb-1">正確率</div>
+                 <div className="text-xl font-bold text-slate-700 flex items-center gap-1">
+                   <CheckCircle size={18} className="text-emerald-500" /> {accuracy}%
+                 </div>
+                 <div className="text-xs text-slate-400">({stats.correct}/{totalQuestions} 題)</div>
+              </div>
+           </div>
+
+           <div className="grid grid-cols-3 gap-2 mb-6">
+             <div className="bg-emerald-50 p-2 rounded-xl">
+               <div className="text-lg font-bold text-emerald-600">{stats.correct}</div>
+               <div className="text-xs text-emerald-800">答對</div>
+             </div>
+             <div className="bg-rose-50 p-2 rounded-xl">
+               <div className="text-lg font-bold text-rose-600">{stats.incorrect}</div>
+               <div className="text-xs text-rose-800">答錯</div>
+             </div>
+             <div className="bg-orange-50 p-2 rounded-xl">
+               <div className="text-lg font-bold text-orange-600">{stats.maxStreak}</div>
+               <div className="text-xs text-orange-800">連勝</div>
+             </div>
+           </div>
+
+           {/* Mini Leaderboard on End Screen */}
+           <div className="mb-6">
+             <LeaderboardView />
+           </div>
+
+           <div className="flex gap-2">
+             <button onClick={goHome} className="flex-1 bg-slate-200 hover:bg-slate-300 text-slate-700 py-3 rounded-xl font-bold transition-all">
+               選單
+             </button>
+             <button onClick={() => startGame(gameMode)} className="flex-1 bg-indigo-600 hover:bg-indigo-700 text-white py-3 rounded-xl font-bold shadow-lg shadow-indigo-200 transition-all">
+               再來一局
+             </button>
+           </div>
+        </div>
+      </div>
+    );
+  }
+
+  // 4. Playing Screen
+  const getTimerColor = () => {
+    const ratio = timeLeft / maxTime;
+    if (ratio > 0.5) return 'bg-emerald-500';
+    if (ratio > 0.2) return 'bg-yellow-500';
+    return 'bg-rose-500';
+  };
+
+  return (
+    <div className="min-h-screen bg-slate-50 flex flex-col items-center py-6 font-sans text-slate-800 pb-20">
+      
+      {/* Header Bar */}
+      <div className="w-full max-w-2xl px-4 mb-4 flex justify-between items-end">
+        <button 
+          onClick={handleManualFinish} 
+          className={`${score > 0 ? 'text-indigo-600 hover:text-indigo-800 bg-indigo-50 px-3 py-1 rounded-lg' : 'text-slate-400 hover:text-indigo-600'} font-bold text-sm flex items-center gap-1 mb-1 transition-all`}
+        >
+          {score > 0 ? (
+            <><StopCircle size={18} /> 結算成績</>
+          ) : (
+            <><ArrowRight size={18} className="rotate-180" /> 放棄</>
+          )}
+        </button>
+        <div className="flex gap-4">
+           {/* Survival Lives */}
+           {gameMode === 'survival' && (
+             <div className="flex gap-1 items-center bg-white px-3 py-1 rounded-full shadow-sm border border-rose-100">
+               {[...Array(5)].map((_, i) => (
+                 <Heart key={i} size={20} className={i < lives ? "fill-rose-500 text-rose-500" : "text-slate-200"} />
+               ))}
+             </div>
+           )}
+           <div className="text-right">
+             <div className="text-xs text-slate-400 font-bold uppercase">{playerName} 的分數</div>
+             <div className="text-2xl font-bold text-indigo-600 leading-none">{score}</div>
+           </div>
+        </div>
+      </div>
+
+      {/* Timer Bar (All modes now use timers) */}
+      <div className="w-full max-w-2xl px-4 mb-6">
+        <div className="flex justify-between text-sm font-bold text-slate-500 mb-1">
+          <span className="flex items-center gap-1">
+            {gameMode === 'timeAttack' ? <Zap size={16} className="text-orange-500"/> : <Clock size={16}/>}
+            {gameMode === 'timeAttack' ? '剩餘時間' : '作答時間'}
+          </span>
+          <span className={`${timeLeft <= 5 ? 'text-rose-500 animate-pulse' : 'text-slate-700'}`}>{timeLeft}s</span>
+        </div>
+        <div className="w-full bg-slate-200 rounded-full h-3 overflow-hidden">
+          <div 
+            className={`h-full transition-all duration-1000 linear ${getTimerColor()}`} 
+            style={{ width: `${(timeLeft / maxTime) * 100}%` }}
+          ></div>
+        </div>
+      </div>
+
+      {/* Main Game Card */}
+      <div className="w-full max-w-2xl px-4">
+        <div className={`bg-white rounded-2xl shadow-xl border-b-4 border-indigo-100 overflow-hidden relative ${isAnimate ? 'animate-pulse' : ''}`}>
+          
+          {/* Difficulty Badge */}
+          <div className="absolute top-4 right-4 bg-white/20 backdrop-blur-sm text-white text-xs px-2 py-1 rounded font-bold border border-white/30 z-10">
+            Level {level}
+          </div>
+
+          {/* Question Section */}
+          <div className="bg-indigo-600 p-8 text-center text-white relative overflow-hidden">
+            <div className="absolute top-0 left-0 w-full h-full opacity-10 pointer-events-none" 
+                 style={{backgroundImage: 'radial-gradient(circle, #fff 1px, transparent 1px)', backgroundSize: '20px 20px'}}></div>
+            <h2 className="text-indigo-200 text-sm font-bold uppercase tracking-wider mb-2">Factorize</h2>
+            <div className="text-5xl font-mono font-bold tracking-tight my-4 drop-shadow-md">
+              {problem ? formatPolynomial(problem.A, problem.B, problem.C) : '...'}
+            </div>
+          </div>
+
+          {/* Interaction Section */}
+          <div className="p-8 pb-4">
+            <div className="flex flex-col md:flex-row items-center justify-center gap-4 text-xl md:text-2xl font-medium text-slate-700 mb-6">
+              {/* Factor 1 */}
+              <div className={`flex items-center bg-slate-100 p-3 rounded-xl border-2 transition-all ${feedback === 'correct' ? 'border-emerald-400 bg-emerald-50' : feedback === 'incorrect' || feedback === 'timeout' ? 'border-rose-200' : 'border-slate-200'} ${activeField.startsWith('a1') || activeField.startsWith('b1') ? 'ring-2 ring-indigo-100 border-indigo-400' : ''}`}>
+                <span className="text-slate-400 mr-2">(</span>
+                <input 
+                  readOnly
+                  type="text" 
+                  placeholder="a"
+                  className={`w-12 text-center bg-transparent border-b-2 outline-none font-bold placeholder-slate-300 ${activeField === 'a1' ? 'border-indigo-600 text-indigo-700' : 'border-slate-300 text-slate-700'}`}
+                  value={userInput.a1}
+                  onClick={() => setActiveField('a1')}
+                />
+                <span className="mx-1">x</span>
+                <span className="mx-1">+</span>
+                <input 
+                  readOnly
+                  type="text" 
+                  placeholder="b"
+                  className={`w-12 text-center bg-transparent border-b-2 outline-none font-bold placeholder-slate-300 ${activeField === 'b1' ? 'border-indigo-600 text-indigo-700' : 'border-slate-300 text-slate-700'}`}
+                  value={userInput.b1}
+                  onClick={() => setActiveField('b1')}
+                />
+                <span className="text-slate-400 ml-2">)</span>
+              </div>
+
+              <span className="text-slate-300 hidden md:block">×</span>
+
+              {/* Factor 2 */}
+              <div className={`flex items-center bg-slate-100 p-3 rounded-xl border-2 transition-all ${feedback === 'correct' ? 'border-emerald-400 bg-emerald-50' : feedback === 'incorrect' || feedback === 'timeout' ? 'border-rose-200' : 'border-slate-200'} ${activeField.startsWith('a2') || activeField.startsWith('b2') ? 'ring-2 ring-indigo-100 border-indigo-400' : ''}`}>
+                <span className="text-slate-400 mr-2">(</span>
+                <input 
+                  readOnly
+                  type="text" 
+                  placeholder="c"
+                  className={`w-12 text-center bg-transparent border-b-2 outline-none font-bold placeholder-slate-300 ${activeField === 'a2' ? 'border-indigo-600 text-indigo-700' : 'border-slate-300 text-slate-700'}`}
+                  value={userInput.a2}
+                  onClick={() => setActiveField('a2')}
+                />
+                <span className="mx-1">x</span>
+                <span className="mx-1">+</span>
+                <input 
+                  readOnly
+                  type="text" 
+                  placeholder="d"
+                  className={`w-12 text-center bg-transparent border-b-2 outline-none font-bold placeholder-slate-300 ${activeField === 'b2' ? 'border-indigo-600 text-indigo-700' : 'border-slate-300 text-slate-700'}`}
+                  value={userInput.b2}
+                  onClick={() => setActiveField('b2')}
+                />
+                <span className="text-slate-400 ml-2">)</span>
+              </div>
+            </div>
+
+            {/* Streak Indicator */}
+            {streak > 1 && (
+              <div className="absolute top-64 right-8 text-orange-500 font-bold animate-bounce-short opacity-80 rotate-12 pointer-events-none">
+                 <div className="text-3xl">{streak}</div>
+                 <div className="text-xs uppercase">Combo!</div>
+              </div>
+            )}
+
+            {/* Solution Display (On Incorrect) - New SVG Cross Design */}
+            {showSolution && problem && (
+               <div className="mt-6 pt-6 border-t border-dashed border-slate-200 animate-slide-down">
+                 <div className="flex justify-center items-center font-mono text-lg text-slate-600 bg-slate-50 p-6 rounded-xl relative">
+                    {/* Container for grid */}
+                    <div className="relative grid grid-cols-2 gap-x-12 gap-y-6 z-10">
+                       {/* Top Left */}
+                       <div className="text-right font-bold text-indigo-600 text-xl">{problem.factors.a1}x</div>
+                       {/* Top Right */}
+                       <div className="text-left font-bold text-emerald-600 text-xl">{problem.factors.b1 > 0 ? `+${problem.factors.b1}` : problem.factors.b1}</div>
+                       
+                       {/* Bottom Left */}
+                       <div className="text-right font-bold text-indigo-600 text-xl">{problem.factors.a2}x</div>
+                       {/* Bottom Right */}
+                       <div className="text-left font-bold text-emerald-600 text-xl">{problem.factors.b2 > 0 ? `+${problem.factors.b2}` : problem.factors.b2}</div>
+                    </div>
+
+                    {/* SVG Cross Overlay */}
+                    <svg className="absolute inset-0 w-full h-full pointer-events-none" style={{ top: '0', left: '0' }}>
+                       {/* Line from Top-Left to Bottom-Right */}
+                       <line x1="40%" y1="35%" x2="60%" y2="65%" stroke="#cbd5e1" strokeWidth="2" />
+                       {/* Line from Bottom-Left to Top-Right */}
+                       <line x1="40%" y1="65%" x2="60%" y2="35%" stroke="#cbd5e1" strokeWidth="2" />
+                    </svg>
+                 </div>
+                 
+                 <div className="mt-4 text-center">
+                   <div className="text-sm font-bold text-slate-700">驗算中間項：</div>
+                   <div className="font-mono text-sm text-slate-500 mt-1">
+                     ({problem.factors.a1}x · {problem.factors.b2}) + ({problem.factors.a2}x · {problem.factors.b1}) = <span className="text-indigo-600 font-bold">{problem.B}x</span>
+                   </div>
+                 </div>
+               </div>
+            )}
+
+          </div>
+        </div>
+
+        {/* Virtual Keypad */}
+        <VirtualKeypad />
+
+      </div>
+    </div>
+  );
+};
+
+export default FactorizationGame;
